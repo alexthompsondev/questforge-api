@@ -1,0 +1,310 @@
+openapi: 3.1.0
+info:
+  title: QuestForge API — Authentication
+  version: 0.1.0
+  description: |
+    JWT auth endpoints for the QuestForge multiplayer indie game backend.
+    Access tokens expire in 15 minutes and should be refreshed using the
+    `/auth/refresh` endpoint with the HttpOnly refresh cookie.
+    Refresh tokens are rotated on each use — reuse triggers revocation of
+    the entire token family (all sessions for that user).
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Send as `Authorization: Bearer <access_token>`
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: UNAUTHORIZED
+            message:
+              type: string
+              description: Human-readable description
+              example: Access token has expired
+            errors:
+              type: array
+              items:
+                type: object
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Stable user identifier
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        email:
+          type: string
+          format: email
+          example: "player@questforge.dev"
+
+    AuthResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        accessToken:
+          type: string
+          description: Short-lived JWT (15m expiry)
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+paths:
+  /auth/register:
+    post:
+      tags: [Authentication]
+      summary: Register a new user account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  description: Unique email address (case-normalized on save)
+                  example: "player@questforge.dev"
+                password:
+                  type: string
+                  minLength: 8
+                  description: Must be at least 8 characters
+                  example: "securePassword123!"
+      responses:
+        '201':
+          description: Account created and tokens issued
+          headers:
+            Set-Cookie:
+              description: |
+                `refresh_token=<jwt>; HttpOnly; SameSite=Strict; Path=/auth/refresh; Max-Age=604800`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+                  accessToken:
+                    type: string
+        '400':
+          description: Validation error (missing/invalid fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Password must be at least 8 characters
+        '409':
+          description: Email already in use
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: EMAIL_IN_USE
+                  message: An account with this email already exists
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      summary: Authenticate and receive a token pair
+      description: |
+        **Rate limited:** 5 attempts per 15 minutes per IP.
+        After 5 failed attempts from the same IP, subsequent requests
+        return `429 Too Many Requests` until the 15-minute window expires.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Authentication successful
+          headers:
+            Set-Cookie:
+              description: HttpOnly refresh token cookie (7d, path=/auth/refresh, SameSite=Strict)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+                  accessToken:
+                    type: string
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: UNAUTHORIZED
+                  message: Invalid email or password
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: TOO_MANY_REQUESTS
+                  message: Too many login attempts. Please try again in 15 minutes.
+
+  /auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Rotate refresh token and issue new access token
+      description: |
+        Implements **refresh token rotation**. The provided refresh token is
+        immediately invalidated and a new token pair is issued.
+        
+        If a previously-used token is presented again (token reuse detection),
+        the entire token family is revoked as a security precaution — all
+        sessions for that user are terminated.
+        
+        The new `refresh_token` cookie replaces the old one.
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: New token pair issued; old refresh token is now invalid
+          headers:
+            Set-Cookie:
+              description: New `refresh_token` cookie (replaces previous, old token is revoked)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+                  accessToken:
+                    type: string
+        '401':
+          description: Missing, invalid, or revoked refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing:
+                  summary: No refresh cookie present
+                  value:
+                    error:
+                      code: UNAUTHORIZED
+                      message: No refresh token provided
+                revoked:
+                  summary: Token reuse detected or token expired
+                  value:
+                    error:
+                      code: UNAUTHORIZED
+                      message: Refresh token has been revoked
+
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Log out current session (single session, clears refresh cookie)
+      responses:
+        '204':
+          description: Logged out, refresh cookie cleared
+        '401':
+          description: No refresh token present
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout-all:
+    post:
+      tags: [Authentication]
+      summary: Revoke all sessions for the authenticated user
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: All sessions revoked
+        '401':
+          description: Missing or invalid access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/me:
+    get:
+      tags: [Authentication]
+      summary: Get authenticated user context (protected)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Authenticated user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+        '401':
+          description: Missing or invalid access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing:
+                  summary: No Authorization header
+                  value:
+                    error:
+                      code: UNAUTHORIZED
+                      message: Missing or malformed Authorization header. Expected: Bearer <token>
+                expired:
+                  summary: Access token expired
+                  value:
+                    error:
+                      code: UNAUTHORIZED
+                      message: Access token has expired
+
+security:
+  - bearerAuth: []
+
+securityDefinitions:
+  cookieAuth:
+    type: apiKey
+    in: cookie
+    name: refresh_token
+    description: HttpOnly JWT refresh token cookie (7d expiry, SameSite=Strict, Path=/auth/refresh)
